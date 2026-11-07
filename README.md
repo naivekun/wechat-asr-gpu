@@ -3,16 +3,20 @@
 微信输入法**离线 ASR 引擎**（上游 `voicekey/crates/wtlocal`，模型容器 `.xnet`）的复刻。
 Rust 引擎支持 NVIDIA CUDA、Apple Silicon MLX、OpenVINO（Intel CPU / GPU / NPU）和原生 CPU，面向批量转写。
 
-历史 CUDA / MLX 实测（各自在对应硬件上运行，`--blk 1600`）：
+不同硬件实测（各自在对应环境运行，`--blk 1600`）：
 
-| 后端 | 硬件 | bv58.wav（58.65s） | 倍实时 | 1 小时音频 |
+| 后端 | 硬件 | 测试音频 | 倍实时 | 1 小时音频 |
 |---|---|---:|---:|---:|
-| **CUDA int8** | RTX 5060 Ti 16GB | 53 ms | **1107x** | **≈3.3 s** |
-| **MLX fp16** | Apple M2 Pro（16 核 GPU / 32GB） | 143 ms | **410x** | **≈8.8 s** |
-| CPU（对照） | 12 核 Intel / M2 Pro | 1.9 s / 3.3 s | 30x / 18x | 2 ~ 3.4 min |
+| **CUDA int8** | RTX 5060 Ti 16GB | bv58 58.65 s：53 ms | **1107x** | **≈3.3 s** |
+| **MLX fp16** | Apple M2 Pro（16 核 GPU / 32GB） | bv58 58.65 s：143 ms | **410x** | **≈8.8 s** |
+| **OpenVINO GPU / NPU**（FP32 / FP16） | Intel Core Ultra 7 258V | joined 54.62 s：222 / 110 ms | **246x / 497x** | **≈14.6 s / ≈7.3 s** |
+| CPU（对照） | 12 核 Intel / M2 Pro | bv58 58.65 s：1.9 s / 3.3 s | 30x / 18x | 2 ~ 3.4 min |
 
 - 正确性：CUDA / CPU 的 int8 GEMM（int32 累加）与 CPU 参考实现**逐元素完全相同**，转录 CER 0~2.6%
   （差异全是同音字/单字级）；MLX 版与 CUDA 版对比 CER 1.2%，`real1.wav` **逐字一致**。
+- OpenVINO NPU 在同一 9 条语料上 6/9 与 CPU 参考逐字一致，规范化字符编辑差异为 3/432；
+  600.87 秒单文件实测 GPU 2.413 秒、NPU 1.138 秒。
+- OpenVINO GPU 的推理精度为 FP32，NPU 为 FP16；两者默认都不是 INT8 激活推理。
 - 模型权重来自微信输入法官方语音包，本仓库不包含、不分发；MIT 只覆盖代码。
 
 ## 快速开始
@@ -32,43 +36,12 @@ cargo build --release --no-default-features --features mlx
 
 # 没有 GPU
 ./target/release/wasr ./models/wtmodel --cpu --threads 8 a.wav
+
+# OpenVINO CPU / GPU / NPU；环境准备见 docs/OPENVINO-REPORT.md
+./target/release/wasr ./models/wtmodel --openvino --ov-device NPU a.wav
 ```
 
 stdout 是 Tab 分隔的 `名字  音频秒  解码毫秒  RTF  文本`；`--json` / `--txt DIR` 可另存。
-
-## OpenVINO（Linux）
-
-准备 OpenVINO C++ SDK，本项目在 2026.4.1 上验证。已有系统 SDK 时可直接构建。
-使用已解压的独立 SDK 时，仅给构建命令指定 `OPENVINO_ROOT=/path/to/openvino` 即可。
-
-```bash
-cargo build --release --locked --no-default-features --features openvino
-
-# 输入为微信输入法独立离线语音包 APK。应用安装包 wxkb_1411_32.apk 只引用该资源。
-./target/release/wasr --unpack ime_asr_decoder_model.apk models/wtmodel
-
-# 输入为 16 kHz 单声道 16-bit PCM WAV。
-./target/release/wasr models/wtmodel --openvino --threads 8 --json result.json --txt transcripts a.wav
-./target/release/wasr models/wtmodel --openvino --ov-device GPU a.wav
-
-# Intel NPU，缓存编译结果供后续进程使用。
-WTL_OV_CACHE_DIR="$PWD/target/local/npu-cache" \
-  ./target/release/wasr models/wtmodel --openvino --ov-device NPU a.wav
-
-# 显式预热常用固定窗口：空缓存会编译，已有缓存只导入并做一次空推理。
-WTL_OV_CACHE_DIR="$PWD/target/local/npu-cache" \
-  ./target/release/wasr models/wtmodel --openvino --ov-device NPU --warmup
-```
-
-`--openvino` 默认用 CPU，`--threads` 控制 OpenVINO CPU 的推理线程数。GPU 需要带 Intel GPU 插件的
-SDK 和可用的 Intel OpenCL 驱动。NPU 需要 OpenVINO NPU 插件和可访问的 Intel NPU 设备。
-GPU 和 NPU 首次遇到某个长度区间时编译静态模型，`WTL_OV_CACHE_DIR` 可指定持久化编译缓存。
-Rust 库可在首次加载前设置 `WTL_OPENVINO=CPU`、`WTL_OPENVINO=GPU` 或 `WTL_OPENVINO=NPU`，
-继续通过 `Model`、`Stream` 和 `transcribe` 调用。
-`WTL_NPU_BUCKETS=500,1000,1500,2000` 可测试更细的固定长度档位；默认仍是
-500/1000/2000，避免额外约 150 MiB 缓存和首次编译开销。
-
-[OpenVINO 验收与性能报告](docs/OPENVINO-REPORT.md)包含语音包来源、测试样本、同机对比及独立 GPU 运行环境。
 
 ## 结构
 
@@ -92,6 +65,7 @@ CUDA 版 91% 的算力是一个 int8 GEMM（int8 权重 × per-row 动态 int8 �
 
 - [docs/REPORT.md](docs/REPORT.md) —— CUDA 版完整实测：线程扩展、逐阶段拆解、路线选型、nsys 数据
 - [docs/MLX-REPORT.md](docs/MLX-REPORT.md) —— Mac 移植：能力矩阵、数值实验、优化历程、M5 预期
+- [docs/OPENVINO-REPORT.md](docs/OPENVINO-REPORT.md) —— OpenVINO CPU / GPU / NPU 验收、部署和实测
 - [docs/OPTIMIZATIONS.md](docs/OPTIMIZATIONS.md) —— 已落地/已回退的各种优化记录
 
 ## License
