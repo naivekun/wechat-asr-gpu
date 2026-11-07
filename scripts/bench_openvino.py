@@ -41,6 +41,10 @@ def run(args, label, flags, durations, out_dir):
         k: v for k, v in os.environ.items()
         if not k.startswith("WTL_") or (k == "WTL_OV_CACHE_DIR" and label == "openvino-npu")
     }
+    if args.cache_root is not None and label.startswith("openvino-"):
+        cache = (args.cache_root / label).resolve()
+        cache.mkdir(parents=True, exist_ok=True)
+        env["WTL_OV_CACHE_DIR"] = str(cache)
     with tempfile.TemporaryFile(mode="w+t") as stderr:
         start = time.perf_counter()
         with subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=stderr, env=env) as child:
@@ -92,6 +96,7 @@ def main():
     ap.add_argument("--repeats", type=int, default=3, help="每个文件预热一次之后的测量次数")
     ap.add_argument("--gpu", action="store_true", help="同时测 OpenVINO GPU")
     ap.add_argument("--npu", action="store_true", help="同时测 OpenVINO NPU")
+    ap.add_argument("--cache-root", type=Path, help="为 OpenVINO 后端分别使用 CACHE_ROOT/<backend>")
     ap.add_argument("--output", type=Path, required=True)
     ap.add_argument("wavs", type=Path, nargs="+")
     args = ap.parse_args()
