@@ -26,6 +26,29 @@ Rust 复用原有的 WAV、fbank、窗口切分与拼接、CTC 和输出逻辑�
 - 验收覆盖独立语音包解包、应用 APK 缺少资源时的报错、真实短语音、54.62 秒跨窗口音频、批量输入、JSON/TXT、静音、极短输入、无采样及错误采样率。
 - `cargo test --locked --no-default-features` 和 `cargo test --locked --no-default-features --features openvino` 均通过。CUDA 与 MLX 的运行基准来自仓库历史报告；本次同机发布复测覆盖 Rust CPU、OpenVINO CPU、Intel Arc 核显和 Intel NPU。
 
+## 测试语料与 CPU 基线
+
+原仓库的主基准使用 `bv58.wav`（58.65 秒）；它来自原测试机的本地 `voicekey/test` 目录，
+仓库不包含该音频，`scripts/bench_threads.py` 也不会自动下载它。原帖中的 CPU T=8 基准如下
+（见 [REPORT.md](REPORT.md) 第 4.3、4.4 节）：
+
+| 语料 | 参数 | CPU 后端 | 解码耗时 | 倍实时 |
+|---|---|---:|---:|---:|
+| `bv58.wav` | `--blk 400` | Rust CPU T=8 | 2,404 ms | 24.4× |
+| `bv58.wav` | `--blk 1600` | Rust CPU T=8 | 1,862 ms | 31.5× |
+
+本次 OpenVINO 复测使用 `joined.wav`（54.62 秒），它是 8 条 Sherpa 测试音频拼接成的
+本地聚合语料；当前 CPU 基线与原帖 `bv58` 不是同一音频，也不在同一台机器上：
+
+| 语料 | 参数 | CPU 后端 | 解码耗时 | 倍实时 |
+|---|---|---:|---:|---:|
+| `joined.wav` 单文件（54.62 s） | `--blk 1600 --threads 8` | Rust CPU，Core Ultra 7 258V | 3,190 ms | 17.1× |
+| 107.25 秒整批（8 短句 + joined） | `--blk 1600 --threads 8` | Rust CPU，Core Ultra 7 258V | 5,425 ms / 整批 | 19.8× |
+
+因此下文的 OpenVINO 对比应以“同一 `joined` 进程、同一机器”的 Rust CPU 行为参照；
+`bv58` 的 OpenVINO 重测仍待原始 `bv58.wav` 提供。不要用原帖的 `bv58` CPU 绝对耗时直接
+和当前 `joined` CPU 或 OpenVINO 数字比较。
+
 ## 同机实测（2026-11-08 发布复测）
 
 2026-11-08 00:01–00:08 CST，Intel Core Ultra 7 258V / Intel Arc 核显 / Intel NPU，Manjaro Linux 7.2.9，OpenVINO 2026.4.1。电池供电，AC online=0，电量 85% → 83%；CPU governor 为 `powersave`，energy preference 为 `power`，platform profile 为 `low-power`。测试期间抑制屏幕自动锁定并停止 `voxtype.service`。四组使用同一个 `target/ov-sdk/release/wasr`、同一份权重和 `--blk 1600 --threads 8`；完整元数据和 binary SHA-256 见 `bench-out/release-bench/report.json`。
