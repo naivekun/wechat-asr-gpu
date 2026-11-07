@@ -9,7 +9,11 @@ use crate::fbank::DIM;
 #[cfg(feature = "cuda")]
 use crate::gpu::{Gpu, NO_BIAS};
 #[cfg(feature = "mlx")]
-use crate::mlx::{Mlx, WlLayerPlan, WlPlan};
+use crate::mlx::Mlx;
+#[cfg(feature = "openvino")]
+use crate::openvino::OpenVino;
+#[cfg(any(feature = "mlx", feature = "openvino"))]
+use crate::weight_plan::{WlLayerPlan, WlPlan};
 use crate::kernels::{dotf, qgemm, quant, QAct};
 use crate::xnet::{self, Rec, F32, I8};
 use anyhow::{bail, Context, Result};
@@ -55,14 +59,14 @@ struct Layer {
 }
 
 /// GPU 权重 blob 里一个 int8 权重矩阵的位置（256B 对齐的偏移）
-#[cfg(any(feature = "cuda", feature = "mlx"))]
+#[cfg(any(feature = "cuda", feature = "mlx", feature = "openvino"))]
 #[derive(Clone, Copy)]
 struct PlanQ {
     off: usize,
     s: f32,
 }
 
-#[cfg(any(feature = "cuda", feature = "mlx"))]
+#[cfg(any(feature = "cuda", feature = "mlx", feature = "openvino"))]
 struct PlanLayer {
     pn_g: usize,
     pn_b: usize,
@@ -78,7 +82,7 @@ struct PlanLayer {
     f2b: usize,
 }
 
-#[cfg(any(feature = "cuda", feature = "mlx"))]
+#[cfg(any(feature = "cuda", feature = "mlx", feature = "openvino"))]
 struct Plan {
     layers: Vec<PlanLayer>,
     lin: PlanQ,
@@ -111,6 +115,8 @@ pub struct Model {
     /// Apple Silicon / MLX 后端（`--mlx`）
     #[cfg(feature = "mlx")]
     mlx: Option<Mlx>,
+    #[cfg(feature = "openvino")]
+    openvino: Option<OpenVino>,
     /// 是否允许用 CUDA graph（由批模式的音频长度决定：短音频捕获开销不划算）
     #[cfg(feature = "cuda")]
     graph_on: std::sync::atomic::AtomicBool,
@@ -146,12 +152,12 @@ impl Loader<'_> {
 }
 
 /// 把 GPU 需要的权重/参数按 256B 对齐拼成一个连续 blob（libwtlgpu 要求对齐指针）
-#[cfg(any(feature = "cuda", feature = "mlx"))]
+#[cfg(any(feature = "cuda", feature = "mlx", feature = "openvino"))]
 struct Blob {
     buf: Vec<u8>,
 }
 
-#[cfg(any(feature = "cuda", feature = "mlx"))]
+#[cfg(any(feature = "cuda", feature = "mlx", feature = "openvino"))]
 impl Blob {
     fn new() -> Blob {
         Blob { buf: Vec::with_capacity(160 << 20) }
@@ -198,7 +204,7 @@ impl Blob {
     }
 }
 
-#[cfg(any(feature = "cuda", feature = "mlx"))]
+#[cfg(any(feature = "cuda", feature = "mlx", feature = "openvino"))]
 fn build_plan(l: &Loader, vocab: usize) -> Result<(Plan, Vec<u8>)> {
     let mut b = Blob::new();
     let mut layers = Vec::with_capacity(LAYERS);
@@ -238,6 +244,14 @@ fn build_plan(l: &Loader, vocab: usize) -> Result<(Plan, Vec<u8>)> {
 
 impl Model {
     pub fn load(dir: &Path) -> Result<Model> {
+        Self::load_impl(dir, true)
+    }
+
+    pub(crate) fn validate(dir: &Path) -> Result<()> {
+        Self::load_impl(dir, false).map(drop)
+    }
+
+    fn load_impl(dir: &Path, accelerated: bool) -> Result<Model> {
         let xnet = std::fs::read_dir(dir)
             .map_err(|_| anyhow::anyhow!("离线模型未下载"))?
             .filter_map(|e| e.ok().map(|e| e.path()))
@@ -272,9 +286,23 @@ impl Model {
         if vocab.len() != out {
             bail!("词表大小 {} 与模型输出 {out} 不符", vocab.len());
         }
+        let ov_device = if accelerated { std::env::var("WTL_OPENVINO").ok() } else { None };
+        #[cfg(not(feature = "openvino"))]
+        if ov_device.is_some() {
+            bail!("这个二进制没有编 OpenVINO 后端");
+        }
+        #[cfg(feature = "openvino")]
+        let openvino = if let Some(device) = &ov_device {
+            let (plan, blob) = build_plan(&l, out)?;
+            let (_layers, mut plan) = to_wl_plan(&plan);
+            plan.vocab = out as i32; // OpenVINO 直接使用真实词表长度。
+            Some(OpenVino::new(&blob, &plan, device)?)
+        } else {
+            None
+        };
         // GPU 后端：一次性把权重拼成对齐 blob 并上传（135MB，约 30~60ms）
         #[cfg(feature = "cuda")]
-        let (gpu, plan) = if std::env::var("WTL_GPU").is_ok() {
+        let (gpu, plan) = if accelerated && ov_device.is_none() && std::env::var("WTL_GPU").is_ok() {
             let (plan, blob) = build_plan(&l, out)?;
             let g = Gpu::new(&blob, TMAX, D, FF, plan.out_n, FLAT, HEADS);
             (Some(g), Some(plan))
@@ -283,7 +311,7 @@ impl Model {
         };
         // MLX 后端（Apple Silicon）：复用同一份 blob/plan，交给 csrc_mlx 一次性反量化成 fp16
         #[cfg(feature = "mlx")]
-        let mlx = if std::env::var("WTL_MLX").is_ok() {
+        let mlx = if accelerated && ov_device.is_none() && std::env::var("WTL_MLX").is_ok() {
             let (pl, blob) = build_plan(&l, out)?;
             let (wl_layers, wl_plan) = to_wl_plan(&pl);
             let _ = &wl_layers; // 必须活到 create 结束：wl_plan.layers 指向它
@@ -308,6 +336,8 @@ impl Model {
             plan,
             #[cfg(feature = "mlx")]
             mlx,
+            #[cfg(feature = "openvino")]
+            openvino,
             #[cfg(feature = "cuda")]
             graph_on: std::sync::atomic::AtomicBool::new(false),
         })
@@ -334,7 +364,29 @@ impl Model {
         }
     }
 
+    pub fn openvino_device(&self) -> Option<&str> {
+        #[cfg(feature = "openvino")]
+        if let Some(backend) = &self.openvino {
+            return Some(backend.device());
+        }
+        None
+    }
+
+    /// Pre-compile or import fixed-size OpenVINO requests. This is a no-op for
+    /// the native CPU path; GPU and NPU use static request buckets.
+    pub fn warmup(&self, frames: &[usize]) -> Result<()> {
+        #[cfg(feature = "openvino")]
+        if let Some(backend) = &self.openvino {
+            return backend.warmup(frames);
+        }
+        let _ = frames;
+        Ok(())
+    }
+
     pub fn gpu_enabled(&self) -> bool {
+        if let Some(device) = self.openvino_device() {
+            return device == "GPU" || device.starts_with("GPU.");
+        }
         #[cfg(feature = "cuda")]
         if self.gpu.is_some() {
             return true;
@@ -366,6 +418,10 @@ impl Model {
 
     /// 输入归一化特征帧，输出每个 50ms 输出帧的 argmax token id
     pub fn forward(&self, x: &[[f32; DIM]]) -> Vec<u32> {
+        #[cfg(feature = "openvino")]
+        if let Some(backend) = &self.openvino {
+            return backend.forward(x);
+        }
         #[cfg(feature = "mlx")]
         if let Some(m) = &self.mlx {
             return m.forward(x);
@@ -642,8 +698,8 @@ impl Model {
     }
 }
 
-/// blob 里的偏移表 → MLX 后端的 plan（字段顺序与 csrc_mlx/wasr_mlx.cc 的 wl_plan 一致）
-#[cfg(feature = "mlx")]
+/// blob 里的偏移表 → MLX / OpenVINO 的共享 plan。
+#[cfg(any(feature = "mlx", feature = "openvino"))]
 fn to_wl_plan(pl: &Plan) -> (Vec<WlLayerPlan>, WlPlan) {
     let layers: Vec<WlLayerPlan> = pl
         .layers

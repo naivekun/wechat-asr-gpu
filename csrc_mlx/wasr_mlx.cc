@@ -41,41 +41,7 @@ static const bool WL_DBG = std::getenv("WASR_MLX_DEBUG") != nullptr;
 // ---------------------------------------------------------------------------
 // 与 Rust 共享的 plan 结构（#[repr(C)] 对应）
 // ---------------------------------------------------------------------------
-typedef struct {
-  size_t pn_g;
-  size_t pn_b;
-  size_t mn_g;
-  size_t mn_b;
-  // 字段顺序必须与 Rust 侧 src/mlx.rs 的 WlLayerPlan 逐字段一致（偏移会经过 padding 校验）
-  size_t q;
-  float qs;
-  size_t k;
-  float ks;
-  size_t v;
-  float vs;
-  size_t o;
-  float os;
-  size_t f1;
-  float f1s;
-  size_t f1b;
-  size_t f2;
-  float f2s;
-  size_t f2b;
-} wl_layer_plan;
-
-typedef struct {
-  const wl_layer_plan* layers;
-  int n_layers;
-  size_t lin;
-  float lin_s;
-  size_t lin_b;
-  size_t out;                        // 输出层 int8 权重（词表已补齐到 4 的倍数）
-  float out_s;
-  size_t out_b;                      // f32 bias，尾部用 -1e30 压死 padding 列
-  int vocab;                         // = out_n（补齐后的列数）
-  int d, ff, flat, heads;
-  size_t c1, c2, c3;                 // 卷积权重 f32，xnet 布局 [O][I][KH][KW]
-} wl_plan;
+#include "../csrc_common/weight_plan.h"
 
 // ---------------------------------------------------------------------------
 // 权重容器

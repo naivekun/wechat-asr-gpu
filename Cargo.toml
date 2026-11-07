@@ -29,6 +29,8 @@ cuda = []
 # Apple Silicon 后端（csrc_mlx/ → libwasr_mlx.a + MLX 的 libmlx.dylib）
 #   cargo build --release --no-default-features --features mlx
 mlx = []
+# OpenVINO Runtime C++ SDK（Linux），通过 OPENVINO_ROOT 可指定独立 SDK
+openvino = []
 
 [profile.release]
 lto = true

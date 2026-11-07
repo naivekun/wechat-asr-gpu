@@ -30,15 +30,59 @@ fn main() {
     if env::var("CARGO_FEATURE_MLX").is_ok() {
         build_mlx(&manifest, &out);
     }
+    if env::var("CARGO_FEATURE_OPENVINO").is_ok() {
+        build_openvino(&manifest, &out);
+    }
     if env::var("CARGO_FEATURE_CUDA").is_ok() {
         build_cuda(&manifest, &out);
     }
+}
+
+/// OpenVINO C++ SDK，默认使用编译器可见的系统头文件和库。
+fn build_openvino(manifest: &Path, out: &Path) {
+    assert_eq!(env::var("CARGO_CFG_TARGET_OS").as_deref(), Ok("linux"), "openvino feature 需要 Linux");
+    let source = "csrc_openvino/wasr_openvino.cc";
+    println!("cargo:rerun-if-changed={source}");
+    println!("cargo:rerun-if-changed=csrc_common/weight_plan.h");
+    for key in ["OPENVINO_ROOT", "CXX"] {
+        println!("cargo:rerun-if-env-changed={key}");
+    }
+
+    let cxx = env::var("CXX").unwrap_or_else(|_| "c++".to_string());
+    let obj = out.join("wasr_openvino.o");
+    let archive = out.join("libwasr_openvino.a");
+    let mut compile = Command::new(&cxx);
+    compile.args(["-std=c++17", "-O2", "-fPIC", "-c"]);
+    if let Some(root) = env::var_os("OPENVINO_ROOT") {
+        let root = PathBuf::from(root).canonicalize().expect("无效的 OPENVINO_ROOT");
+        let runtime = if root.join("runtime/include").is_dir() { root.join("runtime") } else { root };
+        let include = runtime.join("include");
+        let lib = ["lib/intel64", "lib/arm64", "lib", "lib64"].iter()
+            .map(|path| runtime.join(path))
+            .find(|path| path.join("libopenvino.so").is_file())
+            .expect("OPENVINO_ROOT 下找不到 libopenvino.so");
+        assert!(include.join("openvino/openvino.hpp").is_file(), "OPENVINO_ROOT 下找不到 C++ 头文件");
+        compile.arg("-I").arg(include);
+        println!("cargo:rustc-link-search=native={}", lib.display());
+        println!("cargo:rustc-link-arg=-Wl,-rpath,{}", lib.display());
+    }
+    let status = compile.arg(manifest.join(source)).arg("-o").arg(&obj)
+        .status().unwrap_or_else(|e| panic!("无法执行 {cxx}: {e}"));
+    assert!(status.success(), "OpenVINO 后端编译失败，请检查 C++ SDK 与 OPENVINO_ROOT");
+    let status = Command::new("ar").arg("rcs").arg(archive).arg(obj)
+        .status().expect("无法执行 ar");
+    assert!(status.success(), "打包 OpenVINO 后端失败");
+    println!("cargo:rustc-link-search=native={}", out.display());
+    println!("cargo:rustc-link-lib=static=wasr_openvino");
+    println!("cargo:rustc-link-lib=dylib=openvino");
+    println!("cargo:rustc-link-lib=dylib=stdc++");
 }
 
 /// MLX 后端（Apple Silicon）
 fn build_mlx(manifest: &Path, out: &Path) {
     let csrc = manifest.join("csrc_mlx");
     println!("cargo:rerun-if-changed=csrc_mlx/wasr_mlx.cc");
+    println!("cargo:rerun-if-changed=csrc_common/weight_plan.h");
     for k in ["MLX_INCLUDE", "MLX_LIB_DIR", "MLX_PREFIX", "CXX"] {
         println!("cargo:rerun-if-env-changed={k}");
     }

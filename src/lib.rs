@@ -1,5 +1,5 @@
 //! wtlasr —— 微信输入法离线 ASR 引擎（上游 `voicekey/crates/wtlocal`）的纯 Rust 复刻，
-//! 三套计算后端：CUDA（默认 feature）/ Apple Silicon MLX（`--features mlx`）/ CPU。
+//! 计算后端：CUDA（默认 feature）/ Apple Silicon MLX / OpenVINO / CPU。
 //!
 //! aarch64 的 SDOT 内建（vdotq_s32）在 stable Rust 上还是 unstable，所以只在 nightly 上启用
 //! （build.rs 自动检测并设置 `neon_dotprod` cfg）；stable 自动退回标量实现。
@@ -15,6 +15,10 @@ mod fbank;
 mod gpu;
 #[cfg(feature = "mlx")]
 mod mlx;
+#[cfg(feature = "openvino")]
+mod openvino;
+#[cfg(any(feature = "mlx", feature = "openvino"))]
+mod weight_plan;
 mod kernels;
 mod model;
 pub mod pack;
@@ -28,18 +32,28 @@ use anyhow::Result;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-static CACHE: Mutex<Option<(PathBuf, Arc<Model>)>> = Mutex::new(None);
+#[derive(PartialEq, Eq)]
+struct ModelKey {
+    dir: PathBuf,
+    openvino: Option<std::ffi::OsString>,
+}
+
+static CACHE: Mutex<Option<(ModelKey, Arc<Model>)>> = Mutex::new(None);
 
 /// 加载模型（同一目录只加载一次；GPU 后端会在首次加载时把 130MB 权重上传到显存）
 pub fn load(dir: &Path) -> Result<Arc<Model>> {
+    let key = ModelKey {
+        dir: dir.to_path_buf(),
+        openvino: std::env::var_os("WTL_OPENVINO"),
+    };
     let mut c = CACHE.lock().unwrap();
     if let Some((d, m)) = c.as_ref() {
-        if d == dir {
+        if *d == key {
             return Ok(m.clone());
         }
     }
     let m = Arc::new(Model::load(dir)?);
-    *c = Some((dir.to_path_buf(), m.clone()));
+    *c = Some((key, m.clone()));
     Ok(m)
 }
 
@@ -59,7 +73,5 @@ pub fn transcribe(m: Arc<Model>, pcm: &[i16], batch: usize) -> String {
         return s.finish_mlx_batched(batch);
     }
     let _ = batch;
-    let mut s = Stream::new(m);
-    s.push(pcm);
-    s.finish()
+    Stream::new(m).transcribe_batch(pcm)
 }

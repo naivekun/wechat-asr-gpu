@@ -1,18 +1,21 @@
-//! wasr —— 微信输入法离线 ASR 引擎（wtlocal / .xnet）的批模式 CLI，CPU / GPU 双后端。
+//! wasr —— 微信输入法离线 ASR 引擎（wtlocal / .xnet）的批模式 CLI。
 //!
 //! 用法：
 //!   wasr <模型目录> [选项] <a.wav> [b.wav ...]
 //!
 //! 选项：
 //!   --gpu            用 GPU 后端（需要 NVIDIA GPU + CUDA 编译的 libwasr_gpu.so）
+//!   --openvino       用 OpenVINO Runtime（--ov-device CPU|GPU|NPU，默认 CPU）
 //!   --cpu            强制 CPU 后端（对照用）
 //!   --threads N      CPU 线程上限（默认 8；实测 8 是拐点）
 //!   --blk N          解码块长（特征帧，10ms/帧）：默认 1600（批模式最优），流式才用 400
 //!   --json FILE      逐文件结果写 JSON
 //!   --txt DIR        每条音频的转录另存为 DIR/<name>.txt
+//!   --warmup         只编译/导入常用 OpenVINO 静态窗口，不转写
 //!   --unpack PKG DIR 解包官方语音包（.apk）到 DIR，得到模型文件
 //!
 //! stdout 为 Tab 分隔：`名字  音频秒  解码毫秒  RTF  文本`；stderr 打加载信息与批聚合吞吐。
+use anyhow::{bail, Result};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -20,6 +23,9 @@ use wechat_asr_gpu::{load, pack};
 
 /// 后端名字（打印用）
 fn backend_name(m: &wechat_asr_gpu::Model) -> &'static str {
+    if m.openvino_device().is_some() {
+        return "OpenVINO";
+    }
     if !m.gpu_enabled() {
         return "CPU";
     }
@@ -32,6 +38,9 @@ fn backend_name(m: &wechat_asr_gpu::Model) -> &'static str {
 
 /// JSON 里的后端名
 fn backend_tag(m: &wechat_asr_gpu::Model) -> &'static str {
+    if m.openvino_device().is_some() {
+        return "openvino";
+    }
     if !m.gpu_enabled() {
         return "cpu";
     }
@@ -42,19 +51,47 @@ fn backend_tag(m: &wechat_asr_gpu::Model) -> &'static str {
     "gpu"
 }
 
+fn usage_error(message: &str) -> ! {
+    eprintln!("{message}");
+    std::process::exit(2);
+}
+
+fn read_wav(path: &str) -> Result<Vec<i16>> {
+    let reader = hound::WavReader::open(path)?;
+    let spec = reader.spec();
+    if spec.channels != 1 || spec.sample_rate != 16_000
+        || spec.bits_per_sample != 16 || spec.sample_format != hound::SampleFormat::Int
+    {
+        bail!("需要 16 kHz 单声道 16-bit PCM WAV");
+    }
+    let pcm = reader.into_samples::<i16>().collect::<std::result::Result<Vec<_>, _>>()?;
+    if pcm.is_empty() {
+        bail!("WAV 没有采样");
+    }
+    Ok(pcm)
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.is_empty() || args[0] == "-h" || args[0] == "--help" {
         eprintln!(
-            "用法: wasr <模型目录> [--gpu|--mlx|--cpu] [--batch N] [--threads N] [--blk N] [--json FILE] [--txt DIR] <a.wav> [b.wav ...]\n\
+            "用法: wasr <模型目录> [--gpu|--mlx|--openvino|--cpu] [--ov-device CPU|GPU|NPU] [--batch N] [--threads N] [--blk N] [--json FILE] [--txt DIR] <a.wav> [b.wav ...]\n\
              --mlx 需要 macOS + 用 --features mlx 编译（见 README）；--batch 是 MLX 批窗口数（默认 4）\n\
+             --openvino 需要用 --features openvino 编译；--ov-device 默认 CPU\n\
+             --warmup 可单独使用，预编译 WTL_NPU_BUCKETS 或默认 500/1000/2000 帧\n\
              解包官方语音包: wasr --unpack <pak.apk> <模型输出目录>"
         );
         std::process::exit(2);
     }
     if args[0] == "--unpack" {
         let t = Instant::now();
-        pack::unpack(args[1].as_ref(), args[2].as_ref()).unwrap();
+        if args.len() != 3 {
+            usage_error("用法: wasr --unpack <离线语音包.apk> <模型输出目录>");
+        }
+        if let Err(e) = pack::unpack(args[1].as_ref(), args[2].as_ref()) {
+            eprintln!("解包失败: {e:#}");
+            std::process::exit(1);
+        }
         println!("unpacked in {:.1}s", t.elapsed().as_secs_f64());
         return;
     }
@@ -62,23 +99,17 @@ fn main() {
     let dir = PathBuf::from(&args[0]);
     let mut files: Vec<String> = Vec::new();
     let (mut json_out, mut txt_dir) = (None::<String>, None::<String>);
-    let mut gpu = false;
-    let mut mlx = false;
+    let mut backend = None;
+    let mut ov_device = None;
     let mut batch = 4usize;
+    let mut warmup = false;
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
-            "--gpu" => {
-                gpu = true;
-                mlx = false;
-            }
-            "--mlx" => {
-                mlx = true;
-                gpu = false;
-            }
-            "--cpu" => {
-                gpu = false;
-                mlx = false;
+            "--gpu" | "--mlx" | "--openvino" | "--cpu" => backend = Some(args[i].as_str()),
+            "--ov-device" => {
+                i += 1;
+                ov_device = Some(args.get(i).unwrap_or_else(|| usage_error("--ov-device 缺少设备名")));
             }
             "--batch" => {
                 i += 1;
@@ -100,24 +131,35 @@ fn main() {
                 i += 1;
                 txt_dir = Some(args[i].clone());
             }
+            "--warmup" => warmup = true,
             other => files.push(other.to_string()),
         }
         i += 1;
     }
-    if gpu {
-        std::env::set_var("WTL_GPU", "1");
+    if ov_device.is_some() && backend != Some("--openvino") {
+        usage_error("--ov-device 需要与 --openvino 一起使用");
     }
-    if mlx {
-        #[cfg(feature = "mlx")]
-        std::env::set_var("WTL_MLX", "1");
-        #[cfg(not(feature = "mlx"))]
-        {
-            eprintln!("这个二进制没有编 MLX 后端：cargo build --release --no-default-features --features mlx");
-            std::process::exit(2);
+    if let Some(backend) = backend {
+        for key in ["WTL_GPU", "WTL_MLX", "WTL_OPENVINO"] {
+            std::env::remove_var(key);
+        }
+        match backend {
+            "--gpu" => std::env::set_var("WTL_GPU", "1"),
+            "--mlx" if cfg!(feature = "mlx") => std::env::set_var("WTL_MLX", "1"),
+            "--mlx" => usage_error("这个二进制没有编 MLX 后端，请使用 --features mlx"),
+            "--openvino" if cfg!(feature = "openvino") => {
+                std::env::set_var("WTL_OPENVINO", ov_device.map_or("CPU", String::as_str));
+            }
+            "--openvino" => usage_error("这个二进制没有编 OpenVINO 后端，请使用 --features openvino"),
+            _ => {}
         }
     }
     if std::env::var("WTL_BLK").is_err() {
         std::env::set_var("WTL_BLK", "1600"); // 批模式默认块长
+    }
+
+    if files.is_empty() && !warmup {
+        usage_error("没有输入音频");
     }
 
     let t0 = Instant::now();
@@ -129,25 +171,42 @@ fn main() {
         }
     };
     let load_ms = t0.elapsed().as_secs_f64() * 1e3;
+    let device = m.openvino_device().map(|d| format!("({d})")).unwrap_or_default();
     eprintln!(
-        "load {load_ms:.0}ms  backend={}  threads={}  blk={}  batch={}",
+        "load {load_ms:.0}ms  backend={}{device}  threads={}  blk={}  batch={}",
         backend_name(&m),
         std::env::var("WTL_THREADS").unwrap_or_else(|_| "8".into()),
         std::env::var("WTL_BLK").unwrap_or_else(|_| "1600".into()),
         batch
     );
-    if files.is_empty() {
-        eprintln!("没有输入音频");
-        std::process::exit(2);
+    if warmup {
+        let buckets = match std::env::var("WTL_NPU_BUCKETS") {
+            Ok(raw) => raw
+                .split(',')
+                .map(|value| value.parse::<usize>().ok())
+                .collect::<Option<Vec<_>>>()
+                .unwrap_or_else(|| usage_error("WTL_NPU_BUCKETS 需要逗号分隔的正整数")),
+            Err(_) => vec![500, 1000, 2000],
+        };
+        let start = Instant::now();
+        if let Err(error) = m.warmup(&buckets) {
+            eprintln!("warmup failed: {error:#}");
+            std::process::exit(1);
+        }
+        eprintln!(
+            "warmup {buckets:?} in {:.2}s",
+            start.elapsed().as_secs_f64()
+        );
+        wechat_asr_gpu::unload();
+        return;
     }
-
     let mut rows = Vec::new();
     let batch_t0 = Instant::now();
     let (mut total_audio, mut total_ms) = (0.0f64, 0.0f64);
     for f in &files {
         let name = Path::new(f).file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
-        let pcm: Vec<i16> = match hound::WavReader::open(f) {
-            Ok(r) => r.into_samples::<i16>().map(|s| s.unwrap_or(0)).collect(),
+        let pcm = match read_wav(f) {
+            Ok(pcm) => pcm,
             Err(e) => {
                 eprintln!("跳过 {f}: {e}");
                 continue;
@@ -167,6 +226,10 @@ fn main() {
         }
         rows.push((name, audio, ms, ms / 1000.0 / audio, text));
     }
+    if rows.is_empty() {
+        eprintln!("没有可转写的音频");
+        std::process::exit(1);
+    }
     let wall = batch_t0.elapsed().as_secs_f64();
     eprintln!(
         "\n批模式: {} 条, 音频 {:.1}s, 解码合计 {:.2}s, 批墙钟 {:.2}s, 聚合 {:.1}x 实时, 平均 RTF {:.4}",
@@ -180,8 +243,11 @@ fn main() {
 
     if let Some(p) = json_out {
         let mut f = std::fs::File::create(&p).expect("create json");
-        let esc = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', " ");
+        let esc = escape_json;
         writeln!(f, "{{").unwrap();
+        if let Some(device) = m.openvino_device() {
+            writeln!(f, "  \"device\": \"{}\",", esc(device)).unwrap();
+        }
         writeln!(
             f,
             "  \"backend\": \"{}\", \"threads\": {}, \"blk\": {}, \"batch\": {}, \"load_ms\": {:.0},",
@@ -206,7 +272,7 @@ fn main() {
             writeln!(
                 f,
                 "    {{\"name\": \"{}\", \"audio_s\": {:.2}, \"decode_ms\": {:.0}, \"rtf\": {:.4}, \"text\": \"{}\"}}{}",
-                name,
+                esc(name),
                 audio,
                 ms,
                 rtf,
@@ -221,4 +287,18 @@ fn main() {
     }
     // 释放模型：触发出 GPU 上下文销毁（写回 cublasLt 算法缓存、释放显存）
     wechat_asr_gpu::unload();
+}
+
+fn escape_json(s: &str) -> String {
+    use std::fmt::Write;
+    let mut escaped = String::new();
+    for ch in s.chars() {
+        match ch {
+            '"' => escaped.push_str("\\\""),
+            '\\' => escaped.push_str("\\\\"),
+            '\0'..='\u{1f}' => write!(escaped, "\\u{:04x}", ch as u32).unwrap(),
+            _ => escaped.push(ch),
+        }
+    }
+    escaped
 }

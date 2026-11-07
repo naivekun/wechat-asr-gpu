@@ -58,12 +58,25 @@ impl Stream {
     pub fn push(&mut self, pcm: &[i16]) {
         let n = self.feats.len();
         self.fb.push(pcm, &mut self.feats);
-        // 批模式整段喂入时这里就知道总长度：超过阈值才启用 CUDA graph
+        self.fresh += self.feats.len() - n;
+        self.commit_ready();
+    }
+
+    /// 批入口先提取全部特征。短音频的整段解码不需要提前提交分块。
+    pub(crate) fn transcribe_batch(mut self, pcm: &[i16]) -> String {
+        self.push_raw(pcm);
+        if batch_needs_commit(self.feats.len()) {
+            self.commit_ready();
+        }
+        self.finish()
+    }
+
+    fn commit_ready(&mut self) {
+        // 超过阈值才启用 CUDA graph
         // （短音频捕获/实例化开销 > 省下的 host 入队时间）
         if self.feats.len() >= GRAPH_MIN_FRAMES {
             self.m.set_graph_on(true);
         }
-        self.fresh += self.feats.len() - n;
         while self.feats.len() >= self.s + self.cfg.blk + self.cfg.post {
             self.commit();
         }
@@ -168,6 +181,10 @@ impl Stream {
     }
 }
 
+fn batch_needs_commit(frames: usize) -> bool {
+    frames > WHOLE_MAX
+}
+
 const PUNCT: &[char] = &['，', '。', '？', '！', '、', ',', '.', '?', '!'];
 
 /// 拼一个固定网格窗口：[s0-prev, s0+blk+post) + 末尾 PAD 帧静音；左右不足补静音。
@@ -207,4 +224,15 @@ fn window(
 fn tidy(t: &str) -> String {
     let c: Vec<char> = t.trim_start_matches(PUNCT).chars().collect();
     c.iter().enumerate().filter(|&(i, ch)| !(PUNCT.contains(ch) && c.get(i + 1).is_some_and(|n| PUNCT.contains(n)))).map(|(_, ch)| ch).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn short_batch_does_not_precommit() {
+        assert!(!batch_needs_commit(WHOLE_MAX));
+        assert!(batch_needs_commit(WHOLE_MAX + 1));
+    }
 }

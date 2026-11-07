@@ -1,6 +1,6 @@
 //! 官方离线语音包（微信输入法资源 CDN）：外层签名 zip 内嵌 ime_asr_decoder_model.zip
 use crate::Model;
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use std::fs::{self, File};
 use std::io;
 use std::path::Path;
@@ -13,11 +13,14 @@ const FILES: [&str; 1] = ["dict.decoder.utf8.txt"];
 
 /// 解出模型、词表到 dir：先写同级临时目录并试加载，成功后整体改名
 pub fn unpack(pack: &Path, dir: &Path) -> Result<()> {
+    let mut apk = ZipArchive::new(File::open(pack)?)?;
+    let mut payload = apk.by_name("ime_asr_decoder_model.zip")
+        .context("APK 未包含 ime_asr_decoder_model.zip，请使用微信输入法独立离线语音包")?;
     let tmp = dir.with_extension("tmp");
     let _ = fs::remove_dir_all(&tmp);
     fs::create_dir_all(&tmp)?;
     let inner = tmp.join("inner.zip");
-    io::copy(&mut ZipArchive::new(File::open(pack)?)?.by_name("ime_asr_decoder_model.zip")?, &mut File::create(&inner)?)?;
+    io::copy(&mut payload, &mut File::create(&inner)?)?;
     let mut z = ZipArchive::new(File::open(&inner)?)?;
     for i in 0..z.len() {
         let mut e = z.by_index(i)?;
@@ -31,7 +34,7 @@ pub fn unpack(pack: &Path, dir: &Path) -> Result<()> {
     if !FILES.iter().all(|f| tmp.join(f).is_file()) {
         bail!("语音包内容不完整");
     }
-    drop(Model::load(&tmp)?);
+    Model::validate(&tmp)?;
     let _ = fs::remove_dir_all(dir);
     fs::rename(&tmp, dir)?;
     Ok(())
