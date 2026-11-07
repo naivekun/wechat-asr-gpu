@@ -26,3 +26,30 @@ GEMM host 入队 0.0015（graph 之后）、epilogue+gelu 1.0（单位 ms）。
 | 加大窗口到 t1≈1183（整文件一次解） | ❌ 回退 | 更快（299x）但**文本退化**（汤屋→汤污、抗震→抗奋）：超出模型训练时的窗口长度 |
 | `quantized_matmul`（int8 权重） | ❌ | 比 fp16 GEMM 慢 11~24%：Apple 没有 int8 算力，反量化纯属额外开销 |
 | M5+ 的 Metal 4 TensorOps | 待硬件 | M5 起才有原生 int8 `matmul2d`，届时可以 1:1 平移 CUDA 版的 W8A8 契约（也是 Mac 上唯一能"逐字一致"的路），见 MLX-REPORT.md 第五节 |
+
+## OpenVINO / Intel NPU
+
+当前交付路径使用 `INFERENCE_PRECISION_HINT=f16`。XNET 里的矩阵先按 i8 权重读出，再乘
+per-tensor scale 变成 f32 常量；NPU 插件按 f16 执行编译后的图，不是默认 W8A8 INT8 推理。
+`WTL_NPU_PROFILE=1` 会打印 `requested_precision=f16`、驱动/编译器版本和 NPU 调优属性。
+
+| 优化 | 结果 | 结论 |
+|---|---|---|
+| 批入口去除重复推理 | 18 秒音频约 56 ms → 29 ms，逐字一致 | ✅ 默认启用。`transcribe_batch` 在 `WHOLE_MAX` 内只取一次特征，`finish` 整段推理一次；流式 `push` 分块保持不变 |
+| 后台导入并预热常用窗口 | 缓存命中时 3 个档位约 0.27 秒；Voxtype 首句约 99 ms → 33 ms | ✅ daemon 在启动后延迟 250 ms，在后台导入 500/1000/2000；空缓存编译留给 `wasr --warmup` |
+| 增加 1500 帧中间档 | 10.05 秒 28 ms → 21 ms；14.95 秒 27 ms → 22 ms | 可选：`WTL_NPU_BUCKETS=500,1000,1500,2000`。额外约 150 MiB 磁盘缓存，进程峰值 RSS 约 726 → 869 MiB，空缓存首次编译约 11.6 秒，未设为默认 |
+
+评估过但没有合入的路径：W8A8 激活量化能把 18 秒样本从 29 ms 降到 24 ms，但 9 条语料
+多出 12 个字符编辑；QDQ optimization 反而更慢；QKV 投影合并的总吞吐没有改善，缓存和
+常驻内存却分别增加约 21% 和 7%。NPU profiling 显示剩余热点主要是
+`ScaledDotProductAttention`、`MatMul` 和 `Gelu`。
+
+显式预热空缓存：
+
+```bash
+WTL_OV_CACHE_DIR=/path/to/npu-cache \
+  wasr /path/to/models/wtmodel --openvino --ov-device NPU --warmup
+```
+
+本机 Core Ultra 7 258V 上，空缓存预热 500/1000/2000 三档耗时 28.78 秒，生成 423 MiB 缓存；
+再次运行命中缓存约 0.27 秒。
